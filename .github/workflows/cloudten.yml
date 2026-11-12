@@ -1,0 +1,63 @@
+name: Cloudten - new X posts to Telegram
+
+on:
+  schedule:
+    # At minutes 03, 13, ... UTC. Avoids the busiest minute of the hour.
+    - cron: '3,13,23,33,43,53 * * * *'
+  workflow_dispatch:
+    inputs:
+      send_test:
+        description: 'Send the latest post WITH photos again (test only)'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cloudten-monitor
+  cancel-in-progress: false
+
+jobs:
+  check-tweets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Download files
+        uses: actions/checkout@v4
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install libraries
+        run: python -m pip install -r requirements.txt
+
+      - name: Check for new tweets and send to Telegram
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+          X_HANDLE: cloudten_member
+          TEST_MODE: ${{ inputs.send_test }}
+        run: python monitor.py
+
+      - name: Save sent tweet IDs to the repository
+        if: always()
+        run: |
+          if [ -f state.json ] && ! git diff --quiet -- state.json; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add state.json
+            if ! git diff --cached --quiet; then
+              git commit -m "Remember sent X posts [skip ci]"
+              git push
+            fi
+          elif [ -f state.json ] && ! git ls-files --error-unmatch state.json >/dev/null 2>&1; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add state.json
+            git commit -m "Start tweet history [skip ci]"
+            git push
+          fi
