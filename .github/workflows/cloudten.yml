@@ -3,7 +3,7 @@ name: Cloudten - new X posts to Telegram
 on:
   schedule:
     # At minutes 03, 13, ... UTC. Avoids the busiest minute of the hour.
-    - cron: - cron: '7,17,27,37,47,57 * * * *'
+    - cron:  '7,17,27,37,47,57 * * * *'
   workflow_dispatch:
     inputs:
       send_test:
