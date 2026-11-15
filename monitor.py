@@ -6,15 +6,16 @@ No X login or paid API key required. Availability depends on volunteer mirrors.
 from __future__ import annotations
 
 import io
+import base64
 import json
 import os
 import re
 import sys
 import time
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlsplit, urlunsplit
 
 import requests
 from bs4 import BeautifulSoup
@@ -38,6 +39,7 @@ class Tweet:
     text: str
     image_urls: list[str]
     url: str
+    mirror: str = ""
 
 
 def download_feed() -> tuple[str, str]:
@@ -62,10 +64,10 @@ def download_feed() -> tuple[str, str]:
 
 
 def image_url(src: str, base: str) -> str | None:
-    """Turn Nitter's /pic/ proxy path into a Twitter CDN photo URL.
+    """Accept full and shortened Nitter photo proxy URLs, never profile/card images.
 
-    Only photos from pbs.twimg.com/media are accepted. This avoids avatar images,
-    quoted-post artwork and third-party URLs.
+    Nitter may use /pic/pbs.twimg.com%2Fmedia..., /pic/media%2F..., or
+    /pic/orig/media%2F...; the original script only understood the first one.
     """
     if not src:
         return None
@@ -74,19 +76,39 @@ def image_url(src: str, base: str) -> str | None:
     if parts.hostname == "pbs.twimg.com":
         direct = absolute
     elif "/pic/" in parts.path:
-        tail = unquote(parts.path.split("/pic/", 1)[1])
-        if tail.startswith("orig/"):
-            tail = tail[5:]
-        if not tail.startswith(("pbs.twimg.com/", "https://pbs.twimg.com/")):
+        raw_tail = parts.path.split("/pic/", 1)[1]
+        if raw_tail.startswith("orig/"):
+            raw_tail = raw_tail[5:]
+        if raw_tail.startswith("enc/"):
+            encoded = raw_tail[4:]
+            try:
+                raw_tail = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode("utf-8")
+            except (ValueError, UnicodeError):
+                return None
+        else:
+            raw_tail = unquote(raw_tail)
+
+        if raw_tail.startswith("https://pbs.twimg.com/"):
+            direct = raw_tail
+        elif raw_tail.startswith("pbs.twimg.com/"):
+            direct = "https://" + raw_tail
+        elif raw_tail.startswith("media/"):
+            direct = "https://pbs.twimg.com/" + raw_tail
+        else:
             return None
-        direct = tail if tail.startswith("https://") else "https://" + tail
         if parts.query:
             direct += ("&" if "?" in direct else "?") + parts.query
     else:
         return None
+
     check = urlsplit(direct)
-    if check.hostname != "pbs.twimg.com" or not check.path.startswith("/media/"):
+    if check.scheme != "https" or check.hostname != "pbs.twimg.com" or not check.path.startswith("/media/"):
         return None
+    # Telegram's sendPhoto does not support WebP reliably; ask X CDN for JPEG.
+    params = dict(parse_qsl(check.query, keep_blank_values=True))
+    if params.get("format") == "webp":
+        params["format"] = "png" if check.path.lower().endswith(".png") else "jpg"
+        direct = urlunsplit(check._replace(query=urlencode(params)))
     return direct
 
 
@@ -94,13 +116,52 @@ def extract_images(html: str, mirror: str) -> list[str]:
     soup = BeautifulSoup(html or "", "html.parser")
     result = []
     for img in soup.find_all("img"):
-        # A quoted tweet's photos should not be confused with the author's own photos.
+        # Ignore quoted-tweet media; we want only this author's attachments.
         if img.find_parent("blockquote"):
             continue
-        link = image_url(img.get("src", ""), mirror)
-        if link and link not in result:
-            result.append(link)
+        sources = [img.get("src", ""), img.get("data-src", ""), img.get("data-original", "")]
+        if img.get("srcset"):
+            sources.extend(segment.strip().split(" ")[0] for segment in img["srcset"].split(","))
+        for src in sources:
+            link = image_url(src, mirror)
+            if link and link not in result:
+                result.append(link)
     return result[:10]
+
+
+def enrich_missing_images(tweet: Tweet) -> Tweet:
+    """If an RSS item lacked photos, try the post's attachments on Nitter's page.
+
+    Some Nitter instances serve an incomplete RSS item. This does not guarantee
+    recovery if Nitter itself has no access to the photos.
+    """
+    if tweet.image_urls or not tweet.mirror:
+        return tweet
+    page = f"{tweet.mirror}/{HANDLE}/status/{tweet.id}"
+    try:
+        response = SESSION.get(page, timeout=12)
+        response.raise_for_status()
+        if "html" not in response.headers.get("content-type", "").lower():
+            return tweet
+        soup = BeautifulSoup(response.text, "html.parser")
+        main = soup.select_one(".main-tweet")
+        if main is None:
+            print(f"Tweet {tweet.id}: no main-tweet block on Nitter status page")
+            return tweet
+        photos = []
+        # The attachments section is distinct from avatars and quoted tweets.
+        for element in main.select(".attachments img, .attachments a.still-image"):
+            for attribute in ("src", "data-src", "data-original", "href"):
+                url = image_url(element.get(attribute, ""), tweet.mirror)
+                if url and url not in photos:
+                    photos.append(url)
+        if photos:
+            print(f"Tweet {tweet.id}: recovered {len(photos)} photo(s) from status page")
+            return replace(tweet, image_urls=photos[:10])
+        print(f"Tweet {tweet.id}: no photo URLs in RSS or status page")
+    except requests.RequestException as exc:
+        print(f"Tweet {tweet.id}: Nitter status-page fallback unavailable: {exc}")
+    return tweet
 
 
 def extract_text(html: str, title: str) -> str:
@@ -142,21 +203,28 @@ def parse_feed(xml_string: str, mirror: str) -> list[Tweet]:
             text=extract_text(desc, title),
             image_urls=extract_images(desc, mirror),
             url=f"https://x.com/{HANDLE}/status/{tweet_id}",
+            mirror=mirror,
         )
     return sorted(tweets.values(), key=lambda tw: int(tw.id))
 
 
-def get_photo_bytes(src: str) -> tuple[bytes, str]:
-    """Prefer original-size Twitter images, with fallbacks to smaller or mirrored."""
+def get_photo_bytes(src: str, mirror: str = "") -> tuple[bytes, str]:
+    """Try Twitter CDN sizes and, if necessary, the same Nitter photo proxy."""
     parts = urlsplit(src)
     query = dict(parse_qsl(parts.query, keep_blank_values=True))
     candidates = []
-    if "name" in query:
-        for size in ("orig", "large"):
-            adjusted = dict(query, name=size)
-            candidates.append(urlunsplit(parts._replace(query=urlencode(adjusted))))
+    # Try original/large quality even if the feed only supplied thumbnail size.
+    for size in ("orig", "large"):
+        adjusted = dict(query, name=size)
+        candidates.append(urlunsplit(parts._replace(query=urlencode(adjusted))))
     candidates.append(src)
-    # One direct CDN request per size; no proxying of unrelated third-party URLs.
+    if mirror:
+        for candidate in list(candidates):
+            cp = urlsplit(candidate)
+            # Use only the known Nitter instance as a backup proxy for a CDN photo.
+            encoded = quote(cp.hostname + cp.path + ("?" + cp.query if cp.query else ""), safe="")
+            candidates.append(f"{mirror}/pic/{encoded}")
+
     for candidate in dict.fromkeys(candidates):
         try:
             resp = SESSION.get(candidate, timeout=25)
@@ -165,8 +233,10 @@ def get_photo_bytes(src: str) -> tuple[bytes, str]:
                 raise ValueError("not an image")
             if not resp.content or len(resp.content) > 10 * 1024 * 1024:
                 raise ValueError("image empty or exceeds Telegram photo limit")
-            content_type = resp.headers.get("content-type", "image/jpeg").split(";", 1)[0]
-            return resp.content, content_type
+            mime = resp.headers.get("content-type", "image/jpeg").split(";", 1)[0]
+            if mime not in ("image/png", "image/jpeg"):
+                raise ValueError(f"Telegram photo format not supported: {mime}")
+            return resp.content, mime
         except (requests.RequestException, ValueError) as exc:
             print(f"  Photo download failed ({candidate}): {exc}")
     raise RuntimeError(f"Cannot download photo: {src}")
@@ -193,7 +263,7 @@ def send_tweet(tweet: Tweet, token: str, chat_id: str) -> None:
     text = (tweet.text + "\n\n" if tweet.text else "") + "🔗 " + tweet.url
     photo_files = []
     for index, url in enumerate(tweet.image_urls):
-        binary, mime = get_photo_bytes(url)
+        binary, mime = get_photo_bytes(url, tweet.mirror)
         ext = "png" if mime == "image/png" else "jpg"
         photo_files.append((f"file{index}", f"cloudten_{tweet.id}_{index+1}.{ext}", binary, mime))
 
@@ -278,13 +348,14 @@ def main() -> None:
 
     if os.getenv("TEST_MODE", "").lower() == "true":
         test = next((post for post in reversed(posts) if post.image_urls), posts[-1])
+        test = enrich_missing_images(test)
         print(f"Test mode: sending {test.id}; image count={len(test.image_urls)}")
         send_tweet(test, token, chat_id)
         return  # Never change saved IDs in test mode.
 
     if first_run:
         # Send only one initial tweet to prove everything works; don't flood old posts.
-        latest = posts[-1]
+        latest = enrich_missing_images(posts[-1])
         print(f"First run: sending latest tweet {latest.id} and marking feed as seen")
         send_tweet(latest, token, chat_id)
         save_state({post.id for post in posts})
@@ -293,6 +364,8 @@ def main() -> None:
     fresh = [post for post in posts if post.id not in seen]
     print(f"New posts: {len(fresh)}")
     for post in fresh:
+        print(f"Tweet {post.id}: {len(post.image_urls)} photo(s) detected in RSS")
+        post = enrich_missing_images(post)
         send_tweet(post, token, chat_id)
         seen.add(post.id)
         # Persist after each successfully sent post. Workflow commits even on failure.
